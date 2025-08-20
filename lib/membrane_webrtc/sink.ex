@@ -102,7 +102,7 @@ defmodule Membrane.WebRTC.Sink do
     accepted_format:
       any_of(
         %Membrane.H264{alignment: :nalu},
-        %Membrane.RemoteStream{content_format: Membrane.VP8},
+        %Membrane.RemoteStream{content_format: f} when f in [Membrane.VP8, Membrane.RTP],
         Membrane.VP8,
         Membrane.Opus,
         Membrane.RTP
@@ -142,7 +142,7 @@ defmodule Membrane.WebRTC.Sink do
   end
 
   @impl true
-  def handle_pad_added(Pad.ref(:input, pid) = pad_ref, %{pad_options: %{kind: kind}}, state) do
+  def handle_pad_added(Pad.ref(:input, _pid) = pad_ref, %{pad_options: %{kind: kind}}, state) do
     spec =
       cond do
         not state.payload_rtp ->
@@ -152,7 +152,6 @@ defmodule Membrane.WebRTC.Sink do
 
         kind == :audio ->
           bin_input(pad_ref)
-          |> child({:rtp_opus_payloader, pid}, Membrane.RTP.Opus.Payloader)
           |> via_in(pad_ref, options: [kind: :audio, codec: :opus])
           |> get_child(:webrtc)
 

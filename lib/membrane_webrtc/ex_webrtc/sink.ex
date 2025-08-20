@@ -2,6 +2,7 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
   @moduledoc false
 
   use Membrane.Sink
+  alias Membrane.RemoteStream
 
   require Membrane.Logger
 
@@ -24,7 +25,7 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
               ice_ip_filter: []
 
   def_input_pad :input,
-    accepted_format: Membrane.RTP,
+    accepted_format: any_of(Membrane.RTP, %RemoteStream{type: :packetized, content_format: Membrane.RTP}),
     availability: :on_request,
     options: [kind: [], codec: [default: nil]]
 
@@ -184,8 +185,9 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
   end
 
   @impl true
-  def handle_buffer(pad, buffer, _ctx, state) do
-    state = send_buffer(pad, buffer, state)
+  def handle_buffer(pad, buffer, ctx, state) do
+    stream_format = ctx.pads[pad].stream_format
+    state = send_buffer(stream_format, pad, buffer, state)
     {[], state}
   end
 
@@ -344,9 +346,8 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
     %{state | negotiating_tracks: negotiating_tracks, queued_tracks: []}
   end
 
-  defp send_buffer(pad, buffer, state) do
+  defp send_buffer(stream_format, pad, buffer, state) do
     {id, params} = state.input_tracks[pad]
-
     timestamp =
       Membrane.Time.divide_by_timebase(
         buffer.pts,
@@ -355,12 +356,17 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
       |> rem(@max_rtp_timestamp + 1)
 
     packet =
-      ExRTP.Packet.new(buffer.payload,
-        timestamp: timestamp,
-        marker: buffer.metadata[:rtp][:marker] || false,
-        sequence_number: params.seq_num
-      )
-
+      case stream_format do
+        %RemoteStream{type: :packetized, content_format: Membrane.RTP} ->
+          rtp_packet = buffer.metadata[:rtp]
+          %{rtp_packet | payload: buffer.metadata[:payload_before_encoding]}
+        _ ->
+          ExRTP.Packet.new(buffer.payload,
+            timestamp: timestamp,
+            marker: buffer.metadata[:rtp][:marker] || false,
+            sequence_number: params.seq_num
+          )
+      end
     PeerConnection.send_rtp(state.pc, id, packet)
     seq_num = rem(params.seq_num + 1, @max_rtp_seq_num + 1)
     put_in(state.input_tracks[pad], {id, %{params | seq_num: seq_num}})

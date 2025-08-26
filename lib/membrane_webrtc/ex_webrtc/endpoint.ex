@@ -37,22 +37,25 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   defmodule State do
     @moduledoc false
 
-    @type output_track :: %{
+    @type ingress_track :: %{
             status: :awaiting | :connected,
             pad: Membrane.Pad.ref() | nil,
-            params: %{
-              kind: :audio | :video,
-              clock_rate: non_neg_integer(),
-              seq_num: non_neg_integer(),
-              last_keyframe_request_ts: Membrane.Time.t()
-            },
             track: ExWebRTC.MediaStreamTrack.t(),
             first_packet_received: boolean()
           }
 
+    @type egress_track :: %{
+            track: ExWebRTC.MediaStreamTrack.t(),
+            kind: :audio | :video,
+            clock_rate: non_neg_integer(),
+            seq_num: non_neg_integer(),
+            last_keyframe_request_ts: Membrane.Time.t()
+          }
+
     @type t :: %__MODULE__{
             pc: pid() | nil,
-            output_tracks: %{(track_or_pad_id :: term()) => output_track()},
+            ingress_tracks: %{(track_or_pad_id :: term()) => ingress_track()},
+            egress_tracks: %{(track_or_pad_id :: term()) => egress_track()},
             awaiting_outputs: [{:video | :audio, Membrane.Pad.ref()}],
             awaiting_candidates: [ExWebRTC.ICECandidate.t()],
             signaling: Signaling.t() | {:websocket, SimpleWebSocketServer.options()},
@@ -84,7 +87,8 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
                 [
                   video_params: nil,
                   pc: nil,
-                  output_tracks: %{},
+                  ingress_tracks: %{},
+                  egress_tracks: %{},
                   awaiting_outputs: [],
                   awaiting_candidates: [],
                   status: :init,
@@ -104,7 +108,8 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
        ice_port_range: opts.ice_port_range,
        ice_ip_filter: opts.ice_ip_filter,
        keyframe_interval: opts.keyframe_interval,
-       sdp_candidates_timeout: opts.sdp_candidates_timeout
+       sdp_candidates_timeout: opts.sdp_candidates_timeout,
+       egress_tracks: %{}
      }}
   end
 
@@ -148,8 +153,8 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   def handle_pad_added(Pad.ref(:output, track_id) = pad, _ctx, state) do
     state =
       state
-      |> Bunch.Struct.update_in([:output_tracks, track_id], fn output_track ->
-        %{output_track | status: :connected, pad: pad}
+      |> Bunch.Struct.update_in([:ingress_tracks, track_id], fn track ->
+        %{track | status: :connected, pad: pad}
       end)
       |> maybe_answer()
 
@@ -163,20 +168,20 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   end
 
   @impl true
-  def handle_buffer(Pad.ref(:input, _) = pad, buffer, %{pads: pads} = ctx, state) do
+  def handle_buffer(Pad.ref(:input, _) = pad, buffer, %{pads: pads}, state) do
     kind = pads[pad].options.kind
-    case get_output_track_by_kind(kind, state.output_tracks) do
-        {_, output_track} ->
-          {[], send_buffer(output_track, buffer, state)}
+    case get_egress_track_by_kind(kind, state.egress_tracks) do
+        {_, egress_track} ->
+          {[], send_buffer(egress_track, buffer, state)}
         nil ->
-          Membrane.Logger.warning("Dropping packet that arrived on pad #{inspect(pad)} with kind #{inspect(kind)} that has no corresponding output track: #{inspect(state.output_tracks)}")
+          Membrane.Logger.warning("Dropping packet that arrived on pad #{inspect(pad)} with kind #{inspect(kind)} that has no suitable egress track: #{inspect(state.egress_tracks)}")
           {[], state}
     end
   end
 
-  defp get_output_track_by_kind(kind, output_tracks) do
-    state.output_tracks
-    |> Enum.find(fn {_id, %{params: %{kind: ^kind}}} -> true; _ -> false end)
+  defp get_egress_track_by_kind(kind, egress_tracks) do
+    egress_tracks
+    |> Enum.find(fn {_id, %{track: %{kind: ^kind}}} -> true; _ -> false end)
   end
 
   @impl true
@@ -188,7 +193,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   def handle_info({:ex_webrtc, _from, {:rtcp, rtcp_packets}}, _ctx, state) do
     time = Membrane.Time.monotonic_time()
 
-    output_tracks =
+    egress_tracks =
       rtcp_packets
       |> Enum.filter(fn
         {_track_id, %PLI{} = packet} ->
@@ -199,20 +204,22 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
           Membrane.Logger.debug_verbose("Ignoring RTCP packet: #{inspect(packet)}")
           false
       end)
-      |> Enum.reduce(state.output_tracks, fn {track_id, _pli}, output_tracks ->
-        %{params: params} = output_tracks[track_id]
+      |> Enum.reduce(state.egress_tracks, fn {track_id, _pli}, egress_tracks ->
+        %{last_keyframe_request_ts: last_keyframe_request_ts, track: track} = egress_tracks[track_id]
 
-        if params.kind == :video and
-             time - params.last_keyframe_request_ts > @keyframe_request_throttle_time do
+        if track.kind == :video and
+             time - last_keyframe_request_ts > @keyframe_request_throttle_time do
           Membrane.Logger.debug("Sending PLI on track #{inspect(track_id)}")
           :ok = PeerConnection.send_pli(state.pc, track_id)
-          put_in(output_tracks[track_id][:params], %{params | last_keyframe_request_ts: time})
+          Bunch.Struct.update_in(egress_tracks, [track_id], fn etrack ->
+            %{etrack | last_keyframe_request_ts: time}
+          end)
         else
-          output_tracks
+          egress_tracks
         end
       end)
 
-    {[], %{state | output_tracks: output_tracks}}
+    {[], %{state | egress_tracks: egress_tracks}}
   end
 
   @impl true
@@ -222,7 +229,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
       metadata: %{rtp: packet |> Map.from_struct() |> Map.delete(:payload)}
     }
 
-    case state.output_tracks[id] do
+    case state.ingress_tracks[id] do
       %{status: :awaiting, track: track} ->
         Membrane.Logger.warning("""
         Dropping packet of track #{inspect(id)}, kind #{inspect(track.kind)} \
@@ -240,8 +247,8 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
           end
 
         state =
-          Bunch.Struct.update_in(state, [:output_tracks, id], fn output_track ->
-            %{output_track | first_packet_received: true}
+          Bunch.Struct.update_in(state, [:ingress_tracks, id], fn track ->
+            %{track | first_packet_received: true}
           end)
 
         {[buffer: {pad, buffer}] ++ timer_action, state}
@@ -282,27 +289,37 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
     {new_tracks, awaiting_outputs} =
       receive_new_tracks()
       |> Enum.map_reduce(state.awaiting_outputs, fn track, awaiting_outputs ->
-        params = mk_track_params(track)
         case List.keytake(awaiting_outputs, track.kind, 0) do
           nil ->
             {{track.id,
-              %{status: :awaiting, track: track, pad: nil, params: params, first_packet_received: false}},
+              %{status: :awaiting, track: track, pad: nil, first_packet_received: false}},
              awaiting_outputs}
 
           {{_kind, pad}, awaiting_outputs} ->
             {{track.id,
-              %{status: :connected, track: track, pad: pad, params: params, first_packet_received: false}},
+              %{status: :connected, track: track, pad: pad, first_packet_received: false}},
              awaiting_outputs}
         end
       end)
 
-    output_tracks = Map.merge(state.output_tracks, Map.new(new_tracks))
+    ingress_tracks = Map.merge(state.ingress_tracks, Map.new(new_tracks))
+
+    stream_id = ExWebRTC.MediaStreamTrack.generate_stream_id()
+    egress_tracks =
+      ingress_tracks
+      |> Enum.map(fn {_id, track} ->
+          kind = track.track.kind
+          Membrane.Logger.debug("Adding egress track of kind #{inspect(kind)}, for track #{inspect(track.track)}")
+          etrack = ExWebRTC.MediaStreamTrack.new(kind, [stream_id])
+          {:ok, _sender} = PeerConnection.add_track(state.pc, etrack)
+          {etrack.id, mk_egress_track(etrack, kind)}
+        end)
 
     state =
       %{
         state
         | awaiting_outputs: awaiting_outputs,
-          output_tracks: output_tracks,
+          ingress_tracks: ingress_tracks,
           candidates_in_sdp: state.candidates_in_sdp or metadata[:candidates_in_sdp] == true
       }
       |> maybe_answer()
@@ -326,7 +343,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
           []
       end)
 
-    {codecs_notification ++ tracks_notification ++ stream_formats, state}
+    {codecs_notification ++ tracks_notification ++ stream_formats, %{state | egress_tracks: Map.new(egress_tracks)}}
   end
 
   def handle_info(
@@ -401,7 +418,6 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
       )
 
     Process.monitor(pc)
-
     notify_parent = [notify_parent: {:negotiated_video_codecs, negotiated_video_codecs}]
     {notify_parent, %{state | pc: pc, video_params: video_params}}
   end
@@ -409,7 +425,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   defp ensure_peer_connection_started(_sdp, state), do: {[], state}
 
   defp maybe_answer(state) do
-    if Enum.all?(state.output_tracks, fn {_id, %{status: status}} -> status == :connected end) do
+    if Enum.all?(state.ingress_tracks, fn {_id, %{status: status}} -> status == :connected end) do
       %{pc: pc} = state
       {:ok, answer} = PeerConnection.create_answer(pc)
       :ok = PeerConnection.set_local_description(pc, answer)
@@ -490,12 +506,12 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
     signaling
   end
 
-  defp send_buffer(output_track, buffer, state) do
-    %{params: params, track: %{id: track_id}} = output_track
+  defp send_buffer(track, buffer, state) do
+    %{track: %{id: track_id}, clock_rate: clock_rate, seq_num: seq_num} = track
     timestamp =
       Membrane.Time.divide_by_timebase(
         buffer.pts,
-        Ratio.new(Membrane.Time.second(), params.clock_rate)
+        Ratio.new(Membrane.Time.second(), clock_rate)
       )
       |> rem(@max_rtp_timestamp + 1)
 
@@ -503,19 +519,21 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
       ExRTP.Packet.new(buffer.payload,
         timestamp: timestamp,
         marker: buffer.metadata[:rtp][:marker] || false,
-        sequence_number: params.seq_num
+        sequence_number: seq_num
       )
 
     PeerConnection.send_rtp(state.pc, track_id, packet)
-    seq_num = rem(params.seq_num + 1, @max_rtp_seq_num + 1)
-    put_in(state[:output_tracks][track_id][:params], %{params | seq_num: seq_num})
+    seq_num = rem(seq_num + 1, @max_rtp_seq_num + 1)
+    Bunch.Struct.update_in(state, [:egress_tracks, track_id], fn etrack ->
+      %{etrack | seq_num: seq_num}
+    end)
   end
 
-  defp mk_track_params(track) do
+  defp mk_egress_track(track, kind) do
     %{
-      kind: track.kind,
+      track: track,
       clock_rate:
-        case track.kind do
+        case kind do
           :audio -> ExWebRTCUtils.codec_clock_rate(:opus)
           :video -> 90_000
         end,

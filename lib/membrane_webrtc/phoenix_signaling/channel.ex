@@ -13,7 +13,7 @@ if Code.ensure_loaded?(Phoenix) do
 
     @impl true
     def handle_in(signaling_id, msg, socket) do
-      msg = Jason.decode!(msg)
+      msg = if is_map(msg), do: msg, else: Jason.decode!(msg)
       PhoenixSignaling.signal(signaling_id, msg)
       {:noreply, socket}
     end

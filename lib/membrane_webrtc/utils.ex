@@ -9,6 +9,8 @@ defmodule Membrane.WebRTC.Utils do
           | {:whip, [{atom(), term()}]}
         ) ::
           :ok | no_return()
+  def validate_signaling!({:pid, _}), do: :ok
+
   def validate_signaling!(%Signaling{}), do: :ok
 
   def validate_signaling!({:websocket, options}) do

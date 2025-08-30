@@ -53,11 +53,13 @@ defmodule Membrane.WebRTC.Endpoint do
   def_options signaling: [
                 spec:
                   Signaling.t()
+                  | {:pid, pid()}
                   | {:whip, whip_options()}
                   | {:websocket, SimpleWebSocketServer.options()},
                 description: """
                 Signaling channel for passing WebRTC signaling messages (SDP and ICE).
                 Either:
+                - {:pid, pid} - signaling messages will be sent and received via `Membrane.WebRTC.ExWebRTCEndpoint:webrtc_signal/0` messages
                 - `#{inspect(Signaling)}` - See its docs for details.
                 - `{:whip, options}` - Starts a WHIP server, see `t:whip_options/0` for details.
                 - `{:websocket, options}` - Spawns #{inspect(SimpleWebSocketServer)},
@@ -245,6 +247,11 @@ defmodule Membrane.WebRTC.Endpoint do
       end
 
     {[spec: spec], state}
+  end
+
+  @impl true
+  def handle_parent_notification(notification, _ctx, state) do
+    {[{:notify_child, {:webrtc, notification}}], state}
   end
 
   @impl true

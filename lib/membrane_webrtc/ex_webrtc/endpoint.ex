@@ -10,7 +10,10 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   alias ExWebRTC.{ICECandidate, PeerConnection, SessionDescription}
   alias Membrane.WebRTC.{ExWebRTCUtils, Signaling, SimpleWebSocketServer, WhipServer}
 
+  @type webrtc_signal :: {:webrtc_signal, device_id :: String.t(), msg :: map, from :: pid}
+
   def_options signaling: [],
+              device_id: [],
               allowed_video_codecs: [],
               preferred_video_codec: [],
               ice_servers: [],
@@ -53,12 +56,13 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
           }
 
     @type t :: %__MODULE__{
+            device_id: String.t() | nil,
             pc: pid() | nil,
             ingress_tracks: %{(track_or_pad_id :: term()) => ingress_track()},
             egress_tracks: %{(track_or_pad_id :: term()) => egress_track()},
             awaiting_outputs: [{:video | :audio, Membrane.Pad.ref()}],
             awaiting_candidates: [ExWebRTC.ICECandidate.t()],
-            signaling: Signaling.t() | {:websocket, SimpleWebSocketServer.options()},
+            signaling: {:pid, pid()} | Signaling.t() | {:websocket, SimpleWebSocketServer.options()},
             status: :init | :connecting | :connected | :closed,
             audio_params: [ExWebRTC.RTPCodecParameters.t()],
             video_params: [ExWebRTC.RTPCodecParameters.t()],
@@ -85,6 +89,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
 
     defstruct @enforce_keys ++
                 [
+                  device_id: nil,
                   video_params: nil,
                   pc: nil,
                   ingress_tracks: %{},
@@ -100,6 +105,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   def handle_init(_ctx, opts) do
     {[],
      %State{
+       device_id: opts.device_id,
        signaling: opts.signaling,
        audio_params: ExWebRTCUtils.codec_params(:opus),
        allowed_video_codecs: opts.allowed_video_codecs |> Enum.uniq(),
@@ -132,10 +138,36 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
 
   @impl true
   def handle_playing(_ctx, state) do
-    Process.monitor(state.signaling.pid)
-    Signaling.register_element(state.signaling)
-
+    case state.signaling do
+      {:pid, pid} ->
+        Process.monitor(pid)
+      %Signaling{} = signaling ->
+        Process.monitor(signaling.pid)
+        Signaling.register_element(state.signaling)
+    end
     {[], %{state | status: :connecting}}
+  end
+
+  @impl true
+  def handle_parent_notification({:webrtc_signal, device_id, msg}, _ctx, state) do
+    assert_the_same_device_id(device_id, state)
+    case Jason.decode(msg) do
+      {:ok, %{"type" => "sdp_offer", "data" => offer}} ->
+        sdp = %SessionDescription{type: :offer, sdp: offer}
+        handle_sdp_offer(sdp, %{}, %{state | device_id: device_id})
+      {:ok, %{"type" => "sdp_answer", "data" => answer}} ->
+        sdp = %SessionDescription{type: :answer, sdp: answer}
+        handle_sdp_answer(sdp, %{}, state)
+      {:ok, %{"type" => "ice_candidate", "data" => candidate}} ->
+        candidate = ICECandidate.from_json(candidate)
+        handle_ice_candidate(candidate, state)
+      {:ok, %{"type" => other}} ->
+        Membrane.Logger.error("Ignoring unknown WebRTC signaling message type: #{inspect(other)}")
+        {[], state}
+      {:error, reason} ->
+        Membrane.Logger.error("Failed to decode WebRTC signaling message: #{inspect(reason)}")
+        {[], state}
+    end
   end
 
   @impl true
@@ -260,7 +292,17 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
 
   @impl true
   def handle_info({:ex_webrtc, _from, {:ice_candidate, candidate}}, _ctx, state) do
-    Signaling.signal(state.signaling, candidate)
+    case state.signaling do
+      {:pid, pid} ->
+        candidate_json =
+          %{"type" => "ice_candidate", "data" => ICECandidate.to_json(candidate)}
+          |> Jason.encode!()
+        send(pid, {:send_outgoing, :webrtc_signal, state.device_id, candidate_json})
+      %Signaling{} = signaling ->
+        Signaling.signal(signaling, candidate)
+      other ->
+        raise "not implemented #{other}"
+    end
     {[], state}
   end
 
@@ -281,77 +323,15 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
         _ctx,
         state
       ) do
-    Membrane.Logger.debug("Received SDP offer")
-
-    {codecs_notification, state} = ensure_peer_connection_started(sdp, state)
-    :ok = PeerConnection.set_remote_description(state.pc, sdp)
-
-    {new_tracks, awaiting_outputs} =
-      receive_new_tracks()
-      |> Enum.map_reduce(state.awaiting_outputs, fn track, awaiting_outputs ->
-        case List.keytake(awaiting_outputs, track.kind, 0) do
-          nil ->
-            {{track.id,
-              %{status: :awaiting, track: track, pad: nil, first_packet_received: false}},
-             awaiting_outputs}
-
-          {{_kind, pad}, awaiting_outputs} ->
-            {{track.id,
-              %{status: :connected, track: track, pad: pad, first_packet_received: false}},
-             awaiting_outputs}
-        end
-      end)
-
-    ingress_tracks = Map.merge(state.ingress_tracks, Map.new(new_tracks))
-
-    stream_id = ExWebRTC.MediaStreamTrack.generate_stream_id()
-    egress_tracks =
-      ingress_tracks
-      |> Enum.map(fn {_id, track} ->
-          kind = track.track.kind
-          Membrane.Logger.debug("Adding egress track of kind #{inspect(kind)}, for track #{inspect(track.track)}")
-          etrack = ExWebRTC.MediaStreamTrack.new(kind, [stream_id])
-          {:ok, _sender} = PeerConnection.add_track(state.pc, etrack)
-          {etrack.id, mk_egress_track(etrack, kind)}
-        end)
-
-    state =
-      %{
-        state
-        | awaiting_outputs: awaiting_outputs,
-          ingress_tracks: ingress_tracks,
-          candidates_in_sdp: state.candidates_in_sdp or metadata[:candidates_in_sdp] == true
-      }
-      |> maybe_answer()
-
-    tracks_notification =
-      Enum.flat_map(new_tracks, fn
-        {_id, %{status: :awaiting, track: track}} -> [track]
-        _connected_track -> []
-      end)
-      |> case do
-        [] -> []
-        tracks -> [notify_parent: {:new_tracks, tracks}]
-      end
-
-    stream_formats =
-      Enum.flat_map(new_tracks, fn
-        {_id, %{status: :connected, pad: pad}} ->
-          [stream_format: {pad, %Membrane.RTP{}}]
-
-        _other ->
-          []
-      end)
-
-    {codecs_notification ++ tracks_notification ++ stream_formats, %{state | egress_tracks: Map.new(egress_tracks)}}
+    handle_sdp_offer(sdp, metadata, state)
   end
 
   def handle_info(
-        {:membrane_webrtc_signaling, _pid, %SessionDescription{type: :answer} = _sdp, _metadata},
+        {:membrane_webrtc_signaling, _pid, %SessionDescription{type: :answer} = sdp, metadata},
         _ctx,
-        _state
+        state
       ) do
-    raise "WebRTC endpoint received SDP Answer, while it only expects Offer and sends Answer"
+    handle_sdp_answer(sdp, metadata, state)
   end
 
   @impl true
@@ -360,14 +340,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
         _ctx,
         state
       ) do
-    case PeerConnection.add_ice_candidate(state.pc, candidate) do
-      :ok ->
-        {[], state}
-
-      # Workaround for a bug in ex_webrtc that should be fixed in 0.2.0
-      {:error, :no_remote_description} ->
-        {[], %{state | awaiting_candidates: [candidate | state.awaiting_candidates]}}
-    end
+    handle_ice_candidate(candidate, state)
   end
 
   @impl true
@@ -447,7 +420,15 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
           answer
         end
 
-      Signaling.signal(state.signaling, answer)
+      case state.signaling do
+        {:pid, pid} ->
+          json_answer =
+            %{"type" => "sdp_answer", "data" => SessionDescription.to_json(answer)}
+            |> Jason.encode!()
+          send(pid, {:send_outgoing, :webrtc_signal, state.device_id, json_answer})
+        %Signaling{} = signaling ->
+          Signaling.signal(signaling, answer)
+      end
       %{state | awaiting_candidates: [], candidates_in_sdp: false}
     else
       state
@@ -482,6 +463,88 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
 
   defp handle_close(_ctx, state) do
     {[], %{state | status: :closed}}
+  end
+
+  defp handle_sdp_offer(sdp, metadata, state) do
+    Membrane.Logger.debug("Received SDP offer")
+
+    {codecs_notification, state} = ensure_peer_connection_started(sdp, state)
+    :ok = PeerConnection.set_remote_description(state.pc, sdp)
+
+    {new_tracks, awaiting_outputs} =
+      receive_new_tracks()
+      |> Enum.map_reduce(state.awaiting_outputs, fn track, awaiting_outputs ->
+        case List.keytake(awaiting_outputs, track.kind, 0) do
+          nil ->
+            {{track.id,
+              %{status: :awaiting, track: track, pad: nil, first_packet_received: false}},
+             awaiting_outputs}
+
+          {{_kind, pad}, awaiting_outputs} ->
+            {{track.id,
+              %{status: :connected, track: track, pad: pad, first_packet_received: false}},
+             awaiting_outputs}
+        end
+      end)
+
+    ingress_tracks = Map.merge(state.ingress_tracks, Map.new(new_tracks))
+
+    stream_id = ExWebRTC.MediaStreamTrack.generate_stream_id()
+    egress_tracks =
+      ingress_tracks
+      |> Enum.map(fn {_id, track} ->
+          kind = track.track.kind
+          Membrane.Logger.debug("Adding egress track of kind #{inspect(kind)}, for track #{inspect(track.track)}")
+          etrack = ExWebRTC.MediaStreamTrack.new(kind, [stream_id])
+          {:ok, _sender} = PeerConnection.add_track(state.pc, etrack)
+          {etrack.id, mk_egress_track(etrack, kind)}
+        end)
+
+    state =
+      %{
+        state
+        | awaiting_outputs: awaiting_outputs,
+          ingress_tracks: ingress_tracks,
+          candidates_in_sdp: state.candidates_in_sdp or metadata[:candidates_in_sdp] == true
+      }
+      |> maybe_answer()
+
+    tracks_notification =
+      Enum.flat_map(new_tracks, fn
+        {_id, %{status: :awaiting, track: track}} -> [track]
+        _connected_track -> []
+      end)
+      |> case do
+        [] -> []
+        tracks -> [notify_parent: {:new_tracks, tracks}]
+      end
+
+    stream_formats =
+      Enum.flat_map(new_tracks, fn
+        {_id, %{status: :connected, pad: pad}} ->
+          [stream_format: {pad, %Membrane.RTP{}}]
+
+        _other ->
+          []
+      end)
+
+    {codecs_notification ++ tracks_notification ++ stream_formats, %{state | egress_tracks: Map.new(egress_tracks)}}
+  end
+
+  defp handle_sdp_answer(_sdp, _metadata, state) do
+    Membrane.Logger.error("WebRTC endpoint received SDP Answer, while it only expects Offer and sends Answer")
+    {[], state}
+  end
+
+  defp handle_ice_candidate(candidate, state) do
+    case PeerConnection.add_ice_candidate(state.pc, candidate) do
+      :ok ->
+        {[], state}
+
+      # Workaround for a bug in ex_webrtc that should be fixed in 0.2.0
+      {:error, :no_remote_description} ->
+        {[], %{state | awaiting_candidates: [candidate | state.awaiting_candidates]}}
+    end
   end
 
   defp setup_whip(ctx, opts) do
@@ -540,5 +603,12 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
       seq_num: Enum.random(0..@max_rtp_seq_num),
       last_keyframe_request_ts: Membrane.Time.monotonic_time() - @keyframe_request_throttle_time
     }
+  end
+
+  defp assert_the_same_device_id(nil, _state), do: :ok
+  defp assert_the_same_device_id(_device_id, %{device_id: nil}), do: :ok
+  defp assert_the_same_device_id(device_id, %{device_id: device_id}), do: :ok
+  defp assert_the_same_device_id(device_id, %{device_id: other_id}) do
+    raise "Received signaling message for device_id: #{inspect(device_id)}, but already bound to: #{inspect(other_id)}"
   end
 end

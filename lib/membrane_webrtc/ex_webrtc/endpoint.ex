@@ -151,22 +151,16 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   @impl true
   def handle_parent_notification({:webrtc_signal, device_id, msg}, _ctx, state) do
     assert_the_same_device_id(device_id, state)
-    case Jason.decode(msg) do
-      {:ok, %{"type" => "sdp_offer", "data" => offer}} ->
-        sdp = %SessionDescription{type: :offer, sdp: offer}
+    case msg do
+      %{"type" => "sdp_offer", "data" => offer} ->
+        sdp = SessionDescription.from_json(offer)
         handle_sdp_offer(sdp, %{}, %{state | device_id: device_id})
-      {:ok, %{"type" => "sdp_answer", "data" => answer}} ->
-        sdp = %SessionDescription{type: :answer, sdp: answer}
+      %{"type" => "sdp_answer", "data" => answer} ->
+        sdp = SessionDescription.from_json(answer)
         handle_sdp_answer(sdp, %{}, state)
-      {:ok, %{"type" => "ice_candidate", "data" => candidate}} ->
+      %{"type" => "ice_candidate", "data" => candidate} ->
         candidate = ICECandidate.from_json(candidate)
         handle_ice_candidate(candidate, state)
-      {:ok, %{"type" => other}} ->
-        Membrane.Logger.error("Ignoring unknown WebRTC signaling message type: #{inspect(other)}")
-        {[], state}
-      {:error, reason} ->
-        Membrane.Logger.error("Failed to decode WebRTC signaling message: #{inspect(reason)}")
-        {[], state}
     end
   end
 
@@ -292,11 +286,10 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
 
   @impl true
   def handle_info({:ex_webrtc, _from, {:ice_candidate, candidate}}, _ctx, state) do
+    Membrane.Logger.info("New ICE candidate gathered: #{inspect(candidate)}")
     case state.signaling do
       {:pid, pid} ->
-        candidate_json =
-          %{"type" => "ice_candidate", "data" => ICECandidate.to_json(candidate)}
-          |> Jason.encode!()
+        candidate_json = %{"type" => "ice_candidate", "data" => ICECandidate.to_json(candidate)}
         send(pid, {:send_outgoing, :webrtc_signal, state.device_id, candidate_json})
       %Signaling{} = signaling ->
         Signaling.signal(signaling, candidate)
@@ -424,7 +417,6 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
         {:pid, pid} ->
           json_answer =
             %{"type" => "sdp_answer", "data" => SessionDescription.to_json(answer)}
-            |> Jason.encode!()
           send(pid, {:send_outgoing, :webrtc_signal, state.device_id, json_answer})
         %Signaling{} = signaling ->
           Signaling.signal(signaling, answer)
@@ -466,7 +458,7 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   end
 
   defp handle_sdp_offer(sdp, metadata, state) do
-    Membrane.Logger.debug("Received SDP offer")
+    Membrane.Logger.debug("Received SDP offer: #{inspect(sdp)}")
 
     {codecs_notification, state} = ensure_peer_connection_started(sdp, state)
     :ok = PeerConnection.set_remote_description(state.pc, sdp)

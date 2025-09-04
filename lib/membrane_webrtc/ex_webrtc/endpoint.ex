@@ -305,6 +305,12 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
   end
 
   @impl true
+  def handle_info({:ex_webrtc, _from, {:connection_state_change, :failed}}, _ctx, %{status: :connected} = state) do
+    Membrane.Logger.info("ICE connection state changed to :failed, closing PeerConnection")
+    :ok = PeerConnection.stop(state.pc)
+    {[], state}
+  end
+
   def handle_info({:ex_webrtc, _from, message}, _ctx, state) do
     Membrane.Logger.debug("Ignoring ex_webrtc message: #{inspect(message)}")
     {[], state}
@@ -449,11 +455,12 @@ defmodule Membrane.WebRTC.ExWebRTCEndpoint do
       |> Map.values()
       |> Enum.filter(&(&1.direction == :output))
       |> Enum.map(&{:end_of_stream, &1.ref})
-
+    Membrane.Logger.info("WebRTC endpoint closing, sending EOS to pads: #{inspect(actions)}")
     {actions, %{state | status: :closed}}
   end
 
   defp handle_close(_ctx, state) do
+    Membrane.Logger.info("WebRTC endpoint already closed")
     {[], %{state | status: :closed}}
   end
 
